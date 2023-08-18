@@ -1,0 +1,153 @@
+#!/tool/pkg/Python-3.8.1-6/bin/python3
+
+import os
+import sys
+import time
+import socket
+import logging
+import argparse
+import subprocess as sub
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        '--debug',
+        action='store_true'
+    )
+    parser.add_argument(
+        '--tx',
+        help='name of host to transmit to'
+    )
+    parser.add_argument(
+        'port',
+        type=int,
+        help='port number to listen on'
+    )
+    parser.add_argument(
+        'start_time',
+        help='time in HH:MM:SS format when to start the test'
+    )
+    parser.add_argument(
+        'GB',
+        type=float,
+        help='number of gigabytes to transfer'
+    )
+    args = parser.parse_args()
+
+
+    # convert the start time to epoch time
+    # this breaks if it spans midnight or a DST event
+
+    now = time.time()
+    lt = time.localtime(now)
+    date = f'{lt.tm_year:4d}-{lt.tm_mon:02d}-{lt.tm_mday:02d}'
+    lt_start = time.strptime(f'{date} {args.start_time}', '%Y-%m-%d %H:%M:%S')
+    start = time.mktime(lt_start)
+    delta = start - now
+
+    if delta < 0:
+        raise RuntimeError("start time is in the past")
+    elif delta < 15:
+        raise RuntimeError("start time is not far enough in the future")
+
+    # set up logging
+    fmt='%(asctime)s %(message)s'
+    if args.debug:
+        logging.basicConfig(format=fmt, level=logging.DEBUG)
+    else:
+        logging.basicConfig(format=fmt, level=logging.INFO)
+
+    # handle the network transfer
+
+    size = int(args.GB * 1000000000)
+    blocksize = 100000000  # 100 meg
+
+    if args.tx:
+        # create a block of data
+        logging.debug('TX: creating data structure')
+        block = bytes( 'a'.encode('utf-8') * blocksize )
+        logging.debug(f'TX: block is {sys.getsizeof(block)} bytes')
+
+        # try 3 times to connect to the receiver
+        # to account for possible delays in it starting
+        logging.debug(f'TX: connecting to {args.tx}:{args.port}')
+        for _ in range(3):
+            time.sleep(5)
+            try:
+                sock = socket.create_connection( (args.tx, args.port) )
+                break
+            except:
+                pass
+        else:
+            print(f'ERROR: {socket.gethostname()} could not connect to '
+                  f'{args.tx}:{args.port}', file=sys.stderr)
+            sys.exit(1)
+
+        # wait for the start time
+        logging.debug('TX: waiting for start time')
+        while time.time() < start:
+            time.sleep(0.1)
+
+        # send the data
+        n = size
+        logging.debug('TX: sending data')
+        while n > 0:
+            sock.sendall( block[0:min(blocksize, n)] )
+            n -= blocksize
+
+        # wait for the receiver to close the socket
+        logging.debug('TX: waiting for socket to close')
+        while sock.send(bytes(0)) > 0:
+            time.sleep(1)
+
+        # shutdown
+        logging.debug('TX: shutting down')
+        sock.shutdown( socket.SHUT_RDWR )
+        sock.close()
+
+    else:
+        # set up the listener
+        logging.debug(f'RX: creating server on port {args.port}')
+        try:
+            serversock = socket.create_server( ('0.0.0.0', args.port) )
+        except:
+            print(f'ERROR: {socket.gethostname()} could not listen on port '
+                  f'{args.port}', file=sys.stderr)
+            sys.exit(1)
+
+        logging.debug('RX: waiting for connection')
+        # if the connection is not established before the start time
+        # then something went wrong
+        serversock.settimeout(start - time.time())
+        try:
+            (sock, addr) = serversock.accept()
+        except socket.timeout:
+            print(f'ERROR: {socket.gethostname()} timed out waiting for '
+                  'a connection.', file=sys.stderr)    
+            sys.exit(1)
+
+        sock.settimeout(None)
+        txhost = socket.gethostbyaddr(addr[0])[0].split('.')[0]
+        txport = addr[1]
+
+        # receive the data
+        logging.debug(f'RX: ready to receive from {txhost}:{txport}')
+        n = 0
+        while n < size:
+            buf = sock.recv(blocksize)
+            n += len(buf)
+        stop = time.time()
+
+        # close the socket
+        logging.debug('RX: shutting down')
+        sock.shutdown( socket.SHUT_RDWR )
+        sock.close()
+
+        # report the result
+
+        rx = f'{socket.gethostname()}:{args.port}'
+        tx = f'{txhost}:{txport}'
+        secs = stop - start
+        speed = args.GB / secs
+        print(f'{tx:<16s} => {rx:<16s} {speed:6.2f} GB/s {secs:5.2f} s')
+
